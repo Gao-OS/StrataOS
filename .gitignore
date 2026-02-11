@@ -1,0 +1,5 @@
+/bin/
+/result
+*.test
+.devenv/
+.direnv/
