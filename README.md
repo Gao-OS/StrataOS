@@ -134,6 +134,27 @@ echo "hello strata" > /tmp/test.txt
 ./bin/strata-ctl supervisor.status
 ```
 
+## Development
+
+```sh
+# Enter dev shell
+nix develop          # via flake
+devenv shell         # via devenv
+
+# Build all binaries
+go build -o ./bin/ ./cmd/...
+
+# Start supervisor (in one terminal)
+export STRATA_RUNTIME_DIR=/tmp/strata
+mkdir -p "$STRATA_RUNTIME_DIR"
+./bin/supervisor
+
+# Run smoke test (in another terminal)
+sh scripts/smoke.sh
+```
+
+See [docs/EXECUTION.md](docs/EXECUTION.md) for iteration workflow and review checklists.
+
 ## NixOS Module
 
 A scaffold NixOS module is provided at `modules/strata.nix`:

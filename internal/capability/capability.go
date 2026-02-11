@@ -16,12 +16,14 @@ type Capability struct {
 	ExpiresAt   time.Time   `json:"exp"`
 	Service     string      `json:"service"`
 	Actions     []string    `json:"actions"`
+	Rights      []string    `json:"rights,omitempty"`
 	Constraints Constraints `json:"constraints"`
 }
 
 // Constraints limits what a capability token may access.
 type Constraints struct {
 	PathPrefix string `json:"path_prefix,omitempty"`
+	RateLimit  string `json:"rate_limit,omitempty"`
 }
 
 // NewCapability creates a capability with a random ID and the given parameters.

@@ -1,6 +1,7 @@
 // FS service: capability-protected filesystem access over UDS.
 // Requires a valid PASETO token for every operation.
-// Enforces path_prefix constraints from the capability.
+// Authorization is delegated to the centralized policy layer.
+// Handles are bound to the capability that opened them.
 package main
 
 import (
@@ -11,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,45 +20,104 @@ import (
 	"github.com/Gao-OS/StrataOS/internal/auth"
 	"github.com/Gao-OS/StrataOS/internal/capability"
 	"github.com/Gao-OS/StrataOS/internal/ipc"
+	"github.com/Gao-OS/StrataOS/internal/policy"
 )
 
-// handleTable maps opaque handle IDs to open file descriptors.
+// handleEntry binds an open file to the capability that opened it.
+type handleEntry struct {
+	file      *os.File
+	capID     string
+	path      string
+	createdAt time.Time
+}
+
+// handleTable maps opaque handle IDs to open files and tracks revoked capabilities.
 type handleTable struct {
 	mu      sync.RWMutex
-	handles map[string]*os.File
+	handles map[string]*handleEntry
+	revoked map[string]struct{}
 	nextID  atomic.Uint64
 }
 
 func newHandleTable() *handleTable {
-	return &handleTable{handles: make(map[string]*os.File)}
+	return &handleTable{
+		handles: make(map[string]*handleEntry),
+		revoked: make(map[string]struct{}),
+	}
 }
 
-func (ht *handleTable) Open(path string) (string, error) {
+func (ht *handleTable) Open(path, capID string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
+	absPath, _ := filepath.Abs(path)
 	id := fmt.Sprintf("h%d", ht.nextID.Add(1))
 	ht.mu.Lock()
-	ht.handles[id] = f
+	ht.handles[id] = &handleEntry{
+		file:      f,
+		capID:     capID,
+		path:      absPath,
+		createdAt: time.Now(),
+	}
 	ht.mu.Unlock()
 	return id, nil
 }
 
-func (ht *handleTable) Get(id string) (*os.File, bool) {
+func (ht *handleTable) Get(id string) (*handleEntry, bool) {
 	ht.mu.RLock()
 	defer ht.mu.RUnlock()
-	f, ok := ht.handles[id]
-	return f, ok
+	e, ok := ht.handles[id]
+	return e, ok
+}
+
+func (ht *handleTable) Revoke(capID string) {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+	ht.revoked[capID] = struct{}{}
+}
+
+func (ht *handleTable) IsRevoked(capID string) bool {
+	ht.mu.RLock()
+	defer ht.mu.RUnlock()
+	_, ok := ht.revoked[capID]
+	return ok
 }
 
 func (ht *handleTable) CloseAll() {
 	ht.mu.Lock()
 	defer ht.mu.Unlock()
-	for _, f := range ht.handles {
-		f.Close()
+	for _, e := range ht.handles {
+		e.file.Close()
 	}
-	ht.handles = make(map[string]*os.File)
+	ht.handles = make(map[string]*handleEntry)
+}
+
+// extractClaims verifies the PASETO token from the request.
+// Returns nil claims if no token is present (policy.Authorize handles that).
+// Returns an error response only if the token is present but cryptographically invalid.
+func extractClaims(req *ipc.Request, pubKey ed25519.PublicKey) (*capability.Capability, *ipc.Response) {
+	if req.Auth == nil || req.Auth.Token == "" {
+		return nil, nil
+	}
+	cap, err := auth.Verify(req.Auth.Token, pubKey)
+	if err != nil {
+		resp := ipc.ErrorResponse(req.ReqID, ipc.ErrAuthRequired, "invalid token: "+err.Error())
+		return nil, &resp
+	}
+	if cap.IsExpired() {
+		resp := ipc.ErrorResponse(req.ReqID, ipc.ErrAuthRequired, "token expired")
+		return nil, &resp
+	}
+	return cap, nil
+}
+
+// policyError converts a policy.PolicyError into an IPC error response.
+func policyError(reqID string, err error) ipc.Response {
+	if pe, ok := err.(*policy.PolicyError); ok {
+		return ipc.ErrorResponse(reqID, pe.Code, pe.Message)
+	}
+	return ipc.ErrorResponse(reqID, ipc.ErrInternal, err.Error())
 }
 
 func main() {
@@ -86,88 +145,65 @@ func main() {
 	log.Printf("[fs] loaded identity public key")
 
 	handles := newHandleTable()
-
-	verifyToken := func(req *ipc.Request, action string) (*capability.Capability, *ipc.Response) {
-		if req.Auth == nil || req.Auth.Token == "" {
-			resp := ipc.ErrorResponse(req.ReqID, ipc.ErrAuthRequired, "token required")
-			return nil, &resp
-		}
-		cap, err := auth.Verify(req.Auth.Token, pubKey)
-		if err != nil {
-			resp := ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "invalid token: "+err.Error())
-			return nil, &resp
-		}
-		if cap.IsExpired() {
-			resp := ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "token expired")
-			return nil, &resp
-		}
-		if cap.Service != "fs" {
-			resp := ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "token not valid for fs service")
-			return nil, &resp
-		}
-		if !cap.HasAction(action) {
-			resp := ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, fmt.Sprintf("action %q not permitted", action))
-			return nil, &resp
-		}
-		return cap, nil
-	}
-
-	enforcePath := func(cap *capability.Capability, path string) error {
-		if cap.Constraints.PathPrefix == "" {
-			return nil
-		}
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			return fmt.Errorf("resolve path: %w", err)
-		}
-		prefix, err := filepath.Abs(cap.Constraints.PathPrefix)
-		if err != nil {
-			return fmt.Errorf("resolve prefix: %w", err)
-		}
-		// Ensure the path is within the allowed prefix (with trailing separator check).
-		if absPath != prefix && !strings.HasPrefix(absPath, prefix+string(filepath.Separator)) {
-			return fmt.Errorf("path %s outside allowed prefix %s", absPath, prefix)
-		}
-		return nil
-	}
-
 	srv := ipc.NewServer(filepath.Join(runtimeDir, "fs.sock"))
 
 	srv.Handle("fs.open", func(req *ipc.Request) ipc.Response {
-		cap, errResp := verifyToken(req, "open")
+		claims, errResp := extractClaims(req, pubKey)
 		if errResp != nil {
 			return *errResp
 		}
+
 		path, _ := req.Params["path"].(string)
 		if path == "" {
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing path param")
 		}
-		if err := enforcePath(cap, path); err != nil {
-			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, err.Error())
+
+		if err := policy.Authorize(claims, "fs.open", map[string]any{"path": path}); err != nil {
+			return policyError(req.ReqID, err)
 		}
-		handle, err := handles.Open(path)
+
+		if handles.IsRevoked(claims.ID) {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "capability revoked")
+		}
+
+		handle, err := handles.Open(path, claims.ID)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return ipc.ErrorResponse(req.ReqID, ipc.ErrNotFound, "file not found")
 			}
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrInternal, err.Error())
 		}
-		log.Printf("[fs] opened %s -> %s", path, handle)
+		log.Printf("[fs] opened %s -> %s (cap=%s)", path, handle, claims.ID)
 		return ipc.SuccessResponse(req.ReqID, map[string]string{"handle": handle})
 	})
 
 	srv.Handle("fs.read", func(req *ipc.Request) ipc.Response {
-		_, errResp := verifyToken(req, "read")
+		claims, errResp := extractClaims(req, pubKey)
 		if errResp != nil {
 			return *errResp
 		}
+
+		// No path context for read — handle was already opened with permission.
+		if err := policy.Authorize(claims, "fs.read", nil); err != nil {
+			return policyError(req.ReqID, err)
+		}
+
 		handle, _ := req.Params["handle"].(string)
 		if handle == "" {
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing handle param")
 		}
-		f, ok := handles.Get(handle)
+		entry, ok := handles.Get(handle)
 		if !ok {
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrNotFound, "invalid handle")
+		}
+
+		// Handle binding: only the capability that opened the handle may use it.
+		if entry.capID != claims.ID {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "handle not bound to this capability")
+		}
+
+		if handles.IsRevoked(entry.capID) {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "capability revoked")
 		}
 
 		offset, _ := req.Params["offset"].(float64)
@@ -177,7 +213,7 @@ func main() {
 		}
 
 		buf := make([]byte, int(size))
-		n, err := f.ReadAt(buf, int64(offset))
+		n, err := entry.file.ReadAt(buf, int64(offset))
 		if err != nil && err != io.EOF {
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrInternal, err.Error())
 		}
@@ -188,16 +224,22 @@ func main() {
 	})
 
 	srv.Handle("fs.list", func(req *ipc.Request) ipc.Response {
-		cap, errResp := verifyToken(req, "list")
+		claims, errResp := extractClaims(req, pubKey)
 		if errResp != nil {
 			return *errResp
 		}
+
 		path, _ := req.Params["path"].(string)
 		if path == "" {
 			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing path param")
 		}
-		if err := enforcePath(cap, path); err != nil {
-			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, err.Error())
+
+		if err := policy.Authorize(claims, "fs.list", map[string]any{"path": path}); err != nil {
+			return policyError(req.ReqID, err)
+		}
+
+		if handles.IsRevoked(claims.ID) {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrPermDenied, "capability revoked")
 		}
 
 		entries, err := os.ReadDir(path)
@@ -220,6 +262,17 @@ func main() {
 			items = append(items, item)
 		}
 		return ipc.SuccessResponse(req.ReqID, map[string]any{"entries": items})
+	})
+
+	// Internal revocation notification from identity service.
+	srv.Handle("fs.revoke", func(req *ipc.Request) ipc.Response {
+		capID, _ := req.Params["cap_id"].(string)
+		if capID == "" {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing cap_id param")
+		}
+		handles.Revoke(capID)
+		log.Printf("[fs] capability %s revoked (handles invalidated)", capID)
+		return ipc.SuccessResponse(req.ReqID, map[string]string{"status": "revoked"})
 	})
 
 	if err := srv.Start(); err != nil {
