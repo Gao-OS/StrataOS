@@ -51,8 +51,49 @@
           };
         }
       );
+
+      mkNixosConfig = system: nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.strata
+          ({ config, pkgs, ... }: {
+            # Basic system configuration
+            boot.loader.grub.enable = true;
+            boot.loader.grub.device = "/dev/sda";
+
+            networking.hostName = "strata";
+            time.timeZone = "UTC";
+
+            environment.systemPackages = with pkgs; [
+              vim
+              curl
+              git
+            ];
+
+            # Enable Strata runtime
+            services.strata = {
+              enable = true;
+              nodeId = "local-0";
+              package = self.packages.${system}.supervisor;
+              identityPackage = self.packages.${system}.identity;
+              fsPackage = self.packages.${system}.fs;
+            };
+
+            # Minimal configuration for live images/VMs
+            users.users.root.password = "root";
+            services.getty.autologinUser = "root";
+
+            system.stateVersion = "24.05";
+          })
+        ];
+      };
     in
     systemOutputs // {
       nixosModules.strata = import ./modules/strata.nix;
+
+      nixosConfigurations = {
+        strata-iso-x86_64 = mkNixosConfig "x86_64-linux";
+        strata-vm-x86_64 = mkNixosConfig "x86_64-linux";
+      };
     };
 }

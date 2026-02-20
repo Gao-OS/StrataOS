@@ -33,7 +33,9 @@ system, and not a monolithic application. It is a distributed capability-based s
 
 ## Build
 
-### With Nix
+### Individual Binaries
+
+#### With Nix
 
 ```sh
 nix build .#supervisor
@@ -42,13 +44,31 @@ nix build .#fs
 nix build .#strata-ctl
 ```
 
-### With Go
+#### With Go
 
 ```sh
 go build -o ./bin/ ./cmd/...
 ```
 
 Produces: `./bin/supervisor`, `./bin/identity`, `./bin/fs`, `./bin/strata-ctl`
+
+### OS Images
+
+Build bootable NixOS images with Strata pre-configured:
+
+```sh
+# ISO image (live environment, x86_64)
+nix build .#nixosConfigurations.strata-iso-x86_64.config.system.build.isoImage
+# Output: ./result/iso/strata-*.iso
+
+# QEMU VM image (x86_64)
+nix build .#nixosConfigurations.strata-vm-x86_64.config.system.build.vm
+# Output: ./result/bin/run-strata-vm
+# Run: ./result/bin/run-strata-vm
+
+# Boot the ISO in QEMU
+qemu-system-x86_64 -cdrom ./result/iso/strata-*.iso -m 2G
+```
 
 ### Development Shell
 
