@@ -26,10 +26,18 @@ system, and not a monolithic application. It is a distributed capability-based s
         Length-prefixed JSON
 ```
 
-- **Supervisor** starts and manages identity and fs as child processes
-- **Identity** generates an ed25519 keypair and issues PASETO v2.public capability tokens
-- **FS** provides capability-gated filesystem operations (open, read, list)
-- All IPC is local via Unix domain sockets with length-prefixed JSON framing
+- **Supervisor** starts and manages identity and fs as child processes, handles graceful shutdown (SIGINT/SIGTERM)
+- **Identity** generates an ed25519 keypair, issues PASETO v2.public capability tokens, maintains an in-memory revocation list
+- **FS** provides capability-gated filesystem operations (open, read, list), verifies tokens locally using identity's public key, enforces path prefix constraints via centralized policy
+- **strata-ctl** is the CLI client; it infers the target socket from the method prefix (e.g., `fs.open` → `fs.sock`)
+
+### Startup Sequence
+
+Supervisor → starts identity → waits for `identity.pub` → starts fs (loads public key) → opens control socket.
+
+### Authorization Model
+
+All protected handlers call `policy.Authorize(claims, method, ctx)` — deny-by-default. Tokens are service-scoped and carry fully-qualified rights (e.g., `fs.open`). FS handles are bound to the cap_id that opened them and checked for revocation on every access.
 
 ## Build
 
@@ -80,6 +88,7 @@ nix develop
 devenv shell
 strata-build   # builds all binaries to ./bin/
 strata-run     # starts the supervisor
+strata-clean   # removes ./bin and /tmp/strata
 ```
 
 ## Run
@@ -154,26 +163,12 @@ echo "hello strata" > /tmp/test.txt
 ./bin/strata-ctl supervisor.status
 ```
 
-## Development
+## Testing
 
 ```sh
-# Enter dev shell
-nix develop          # via flake
-devenv shell         # via devenv
-
-# Build all binaries
-go build -o ./bin/ ./cmd/...
-
-# Start supervisor (in one terminal)
-export STRATA_RUNTIME_DIR=/tmp/strata
-mkdir -p "$STRATA_RUNTIME_DIR"
-./bin/supervisor
-
-# Run smoke test (in another terminal)
+# Run smoke test (with supervisor running in another terminal)
 sh scripts/smoke.sh
 ```
-
-See [docs/EXECUTION.md](docs/EXECUTION.md) for iteration workflow and review checklists.
 
 ## NixOS Module
 
@@ -197,6 +192,19 @@ A scaffold NixOS module is provided at `modules/strata.nix`:
 
 See [api/protocol.md](api/protocol.md) for the full IPC protocol specification.
 
+Error codes:
+
+| Code | Name                | Meaning                    |
+|------|---------------------|----------------------------|
+| 1    | INVALID_ARGUMENT    | Malformed or missing param |
+| 2    | UNAUTHENTICATED     | Token missing or invalid   |
+| 3    | PERMISSION_DENIED   | Insufficient rights        |
+| 4    | NOT_FOUND           | Resource does not exist    |
+| 5    | INTERNAL            | Unexpected server error    |
+| 6    | UNAVAILABLE         | Service not reachable      |
+| 7    | RESOURCE_EXHAUSTED  | Rate limit exceeded        |
+| 8    | CONFLICT            | State conflict             |
+
 ## Project Structure
 
 ```
@@ -209,10 +217,17 @@ internal/
   ipc/           Length-prefixed JSON framing and UDS server
   auth/          Ed25519 keys, PASETO signing/verification, revocation
   capability/    Token claims and constraint types
+  policy/        Centralized authorization and constraint enforcement
 modules/
   strata.nix     NixOS module scaffold
 api/
   protocol.md    IPC protocol specification
+docs/
+  PLAN.md        Roadmap (v0.3 → v0.4)
+  EXECUTION.md   Iteration workflow and review checklists
+  POLICY_REVIEW.md  Security review and known issues
+scripts/
+  smoke.sh       Integration smoke test
 ```
 
 ## Tech Stack
@@ -224,5 +239,6 @@ api/
 | Protocol        | Length-prefixed JSON      |
 | Tokens          | PASETO v2.public (ed25519) |
 | Build           | Nix flakes               |
+| OS Images       | NixOS configurations     |
 | Dev             | devenv                   |
 | Future control  | Elixir (not yet implemented) |
