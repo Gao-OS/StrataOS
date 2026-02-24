@@ -16,8 +16,8 @@ system, and not a monolithic application. It is a distributed capability-based s
 │  (lifecycle, control socket)        │
 │                                     │
 │  ┌──────────┐    ┌──────────┐       │
-│  │ Identity  │    │    FS    │       │
-│  │ (tokens)  │    │ (files)  │       │
+│  │ Identity │    │    FS    │       │
+│  │ (tokens) │    │ (files)  │       │
 │  └────┬─────┘    └────┬─────┘       │
 │       │               │             │
 │  identity.sock     fs.sock          │
