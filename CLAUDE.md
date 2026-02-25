@@ -36,11 +36,45 @@ devenv shell       # devenv-based (then: strata-build, strata-run, strata-clean)
 
 ## Testing
 
-No unit tests exist yet — this is the highest-priority gap (see `docs/POLICY_REVIEW.md` item 8). Integration validation uses the smoke test:
+```sh
+# Run all unit tests
+go test ./internal/...
+
+# Run with race detector
+go test -race ./internal/...
+
+# Verbose output
+go test -v ./internal/...
+
+# Run a specific package
+go test ./internal/policy/
+
+# Integration smoke test (start supervisor first)
+sh scripts/smoke.sh
+```
+
+## Go Tooling
+
+Available via `devenv shell`:
 
 ```sh
-# Start supervisor in one terminal, then in another:
-sh scripts/smoke.sh
+# LSP (editor integration)
+gopls                          # Go language server
+
+# Linting
+golangci-lint run              # aggregated linter (vet, errcheck, staticcheck, etc.)
+staticcheck ./...              # standalone static analysis
+
+# Formatting
+goimports -w .                 # gofmt + auto-manage imports
+go fmt ./...                   # standard formatting
+
+# Debugging
+dlv debug ./cmd/supervisor     # interactive debugger
+dlv test ./internal/policy     # debug tests
+
+# Vetting
+go vet ./...                   # built-in static checks
 ```
 
 ## Architecture

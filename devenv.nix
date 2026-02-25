@@ -3,6 +3,14 @@
 {
   languages.go.enable = true;
 
+  packages = [
+    pkgs.gopls
+    pkgs.golangci-lint
+    pkgs.gotools        # goimports, godoc, etc.
+    pkgs.delve          # debugger
+    pkgs.go-tools       # staticcheck
+  ];
+
   scripts.strata-build.exec = ''
     echo "Building Strata services..."
     go build -o ./bin/ ./cmd/...
