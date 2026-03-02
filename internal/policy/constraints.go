@@ -23,7 +23,7 @@ func enforceConstraints(claims *capability.Capability, ctx map[string]any) error
 }
 
 // enforcePathPrefix ensures ctx["path"] is within the allowed prefix.
-// Rejects ".." traversal attempts.
+// Rejects absolute paths (protocol requires relative-only) and ".." traversal attempts.
 func enforcePathPrefix(prefix string, ctx map[string]any) error {
 	if prefix == "" {
 		return nil
@@ -31,6 +31,15 @@ func enforcePathPrefix(prefix string, ctx map[string]any) error {
 	path, _ := ctx["path"].(string)
 	if path == "" {
 		return nil
+	}
+
+	// Protocol requires relative paths only.
+	if strings.HasPrefix(path, "/") {
+		return &PolicyError{
+			Code:    CodePermissionDenied,
+			Name:    "PERMISSION_DENIED",
+			Message: "absolute paths not allowed; use relative paths under path_prefix",
+		}
 	}
 
 	if strings.Contains(path, "..") {
@@ -41,20 +50,21 @@ func enforcePathPrefix(prefix string, ctx map[string]any) error {
 		}
 	}
 
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return &PolicyError{
-			Code:    CodePermissionDenied,
-			Name:    "PERMISSION_DENIED",
-			Message: fmt.Sprintf("cannot resolve path: %v", err),
-		}
-	}
+	// Resolve the full path: prefix + relative path.
 	absPrefix, err := filepath.Abs(prefix)
 	if err != nil {
 		return &PolicyError{
 			Code:    CodePermissionDenied,
 			Name:    "PERMISSION_DENIED",
 			Message: fmt.Sprintf("cannot resolve prefix: %v", err),
+		}
+	}
+	absPath, err := filepath.Abs(filepath.Join(prefix, path))
+	if err != nil {
+		return &PolicyError{
+			Code:    CodePermissionDenied,
+			Name:    "PERMISSION_DENIED",
+			Message: fmt.Sprintf("cannot resolve path: %v", err),
 		}
 	}
 
@@ -67,6 +77,9 @@ func enforcePathPrefix(prefix string, ctx map[string]any) error {
 	}
 	return nil
 }
+
+// staleBucketTTL is the duration after which an unused rate limit bucket is evicted.
+const staleBucketTTL = 5 * time.Minute
 
 // In-memory token bucket rate limiter, keyed by cap_id.
 var globalLimiter = &rateLimiter{
@@ -97,26 +110,40 @@ func parseRate(s string) (float64, bool) {
 	return n, true
 }
 
+// CodeInvalidArgument matches the protocol error code for bad input.
+const CodeInvalidArgument = 1
+
 func enforceRateLimit(capID, rateLimit string) error {
 	if rateLimit == "" {
 		return nil
 	}
 	rate, ok := parseRate(rateLimit)
 	if !ok {
-		return nil
+		return &PolicyError{
+			Code:    CodeInvalidArgument,
+			Name:    "INVALID_ARGUMENT",
+			Message: fmt.Sprintf("unparseable rate limit: %q (expected format: \"50rps\")", rateLimit),
+		}
 	}
 
 	globalLimiter.mu.Lock()
 	defer globalLimiter.mu.Unlock()
 
+	// Lazy eviction of stale buckets to prevent unbounded memory growth.
+	now := time.Now()
+	for id, b := range globalLimiter.buckets {
+		if now.Sub(b.last) > staleBucketTTL {
+			delete(globalLimiter.buckets, id)
+		}
+	}
+
 	b, exists := globalLimiter.buckets[capID]
 	if !exists {
-		b = &bucket{tokens: rate, rate: rate, last: time.Now()}
+		b = &bucket{tokens: rate, rate: rate, last: now}
 		globalLimiter.buckets[capID] = b
 	}
 
 	// Refill tokens based on elapsed time.
-	now := time.Now()
 	b.tokens += now.Sub(b.last).Seconds() * b.rate
 	if b.tokens > b.rate {
 		b.tokens = b.rate

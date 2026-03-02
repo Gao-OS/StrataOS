@@ -38,8 +38,44 @@ func TestErrorResponse(t *testing.T) {
 	if resp.Error.Code != ErrPermDenied {
 		t.Errorf("Error.Code = %d, want %d", resp.Error.Code, ErrPermDenied)
 	}
+	if resp.Error.Name != "PERMISSION_DENIED" {
+		t.Errorf("Error.Name = %q, want %q", resp.Error.Name, "PERMISSION_DENIED")
+	}
 	if resp.Error.Message != "access denied" {
 		t.Errorf("Error.Message = %q, want %q", resp.Error.Message, "access denied")
+	}
+}
+
+func TestFullErrorResponse(t *testing.T) {
+	details := map[string]any{"field": "path"}
+	resp := FullErrorResponse("req-f", ErrInvalidRequest, "INVALID_ARGUMENT", "bad path", details)
+	if resp.OK {
+		t.Error("OK should be false")
+	}
+	if resp.Error.Name != "INVALID_ARGUMENT" {
+		t.Errorf("Error.Name = %q, want %q", resp.Error.Name, "INVALID_ARGUMENT")
+	}
+	if resp.Error.Details["field"] != "path" {
+		t.Errorf("Error.Details[field] = %v, want %q", resp.Error.Details["field"], "path")
+	}
+}
+
+func TestErrorResponse_AllCodes(t *testing.T) {
+	codes := map[int]string{
+		ErrInvalidRequest:  "INVALID_ARGUMENT",
+		ErrAuthRequired:    "UNAUTHENTICATED",
+		ErrPermDenied:      "PERMISSION_DENIED",
+		ErrNotFound:        "NOT_FOUND",
+		ErrInternal:        "INTERNAL",
+		ErrUnavailable:     "UNAVAILABLE",
+		ErrResourceExhaust: "RESOURCE_EXHAUSTED",
+		ErrConflict:        "CONFLICT",
+	}
+	for code, name := range codes {
+		resp := ErrorResponse("req", code, "msg")
+		if resp.Error.Name != name {
+			t.Errorf("code %d: Name = %q, want %q", code, resp.Error.Name, name)
+		}
 	}
 }
 

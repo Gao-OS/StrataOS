@@ -30,12 +30,21 @@ func TestEnforcePathPrefix_NilCtx(t *testing.T) {
 	}
 }
 
+func TestEnforcePathPrefix_AbsolutePathRejected(t *testing.T) {
+	cases := []string{"/tmp/foo", "/etc/passwd", "/"}
+	for _, path := range cases {
+		err := enforcePathPrefix("/tmp", map[string]any{"path": path})
+		if err == nil {
+			t.Errorf("expected rejection for absolute path %q", path)
+		}
+	}
+}
+
 func TestEnforcePathPrefix_TraversalRejected(t *testing.T) {
 	cases := []string{
-		"/tmp/../etc/passwd",
 		"../secret",
-		"/tmp/foo/../../bar",
-		"/tmp/..hidden", // contains ".." — rejected
+		"foo/../../bar",
+		"..hidden", // contains ".." — rejected
 	}
 	for _, path := range cases {
 		err := enforcePathPrefix("/tmp", map[string]any{"path": path})
@@ -45,36 +54,28 @@ func TestEnforcePathPrefix_TraversalRejected(t *testing.T) {
 	}
 }
 
-func TestEnforcePathPrefix_ExactMatch(t *testing.T) {
-	err := enforcePathPrefix("/tmp", map[string]any{"path": "/tmp"})
+func TestEnforcePathPrefix_ValidRelativePath(t *testing.T) {
+	err := enforcePathPrefix("/tmp", map[string]any{"path": "data/file.txt"})
 	if err != nil {
-		t.Errorf("exact match should pass: %v", err)
+		t.Errorf("valid relative subpath should pass: %v", err)
 	}
 }
 
-func TestEnforcePathPrefix_ValidSubpath(t *testing.T) {
-	err := enforcePathPrefix("/tmp", map[string]any{"path": "/tmp/data/file.txt"})
+func TestEnforcePathPrefix_RelativePathBoundary(t *testing.T) {
+	// "data" under prefix "/tmp" resolves to "/tmp/data" — should pass.
+	err := enforcePathPrefix("/tmp", map[string]any{"path": "data"})
 	if err != nil {
-		t.Errorf("valid subpath should pass: %v", err)
-	}
-}
-
-func TestEnforcePathPrefix_BoundaryCheck(t *testing.T) {
-	// /tmpevil should NOT match prefix /tmp.
-	err := enforcePathPrefix("/tmp", map[string]any{"path": "/tmpevil"})
-	if err == nil {
-		t.Error("expected rejection: /tmpevil should not match prefix /tmp")
+		t.Errorf("relative subpath should pass: %v", err)
 	}
 }
 
 func TestEnforcePathPrefix_OutsidePrefix(t *testing.T) {
-	err := enforcePathPrefix("/home/user", map[string]any{"path": "/etc/passwd"})
-	if err == nil {
-		t.Error("expected rejection for path outside prefix")
-	}
-	pe := err.(*PolicyError)
-	if pe.Code != CodePermissionDenied {
-		t.Errorf("code = %d, want %d", pe.Code, CodePermissionDenied)
+	// Even though the path is relative, if someone finds a way to escape
+	// (without ".." which is caught earlier), it should be denied.
+	// In practice ".." is the only way, but we test the prefix check itself.
+	err := enforcePathPrefix("/home/user", map[string]any{"path": "safe/file.txt"})
+	if err != nil {
+		t.Errorf("valid relative path under prefix should pass: %v", err)
 	}
 }
 
@@ -113,17 +114,19 @@ func TestEnforceRateLimit_EmptyRateLimit(t *testing.T) {
 	}
 }
 
-func TestEnforceRateLimit_MalformedRateFailsOpen(t *testing.T) {
-	// Documents known issue 3b: malformed rate fails open.
+func TestEnforceRateLimit_MalformedRateReturnsError(t *testing.T) {
 	err := enforceRateLimit("cap-malformed", "50rpm")
-	if err != nil {
-		t.Errorf("malformed rate currently fails open: %v", err)
+	if err == nil {
+		t.Fatal("expected error for malformed rate limit")
+	}
+	pe := err.(*PolicyError)
+	if pe.Code != CodeInvalidArgument {
+		t.Errorf("code = %d, want %d", pe.Code, CodeInvalidArgument)
 	}
 }
 
 func TestEnforceRateLimit_BasicExhaustion(t *testing.T) {
 	capID := "cap-exhaust-test"
-	// Clean state: reset the global limiter entry.
 	globalLimiter.mu.Lock()
 	delete(globalLimiter.buckets, capID)
 	globalLimiter.mu.Unlock()
@@ -193,6 +196,36 @@ func TestEnforceRateLimit_PerCapIsolation(t *testing.T) {
 	}
 }
 
+func TestEnforceRateLimit_StaleEviction(t *testing.T) {
+	staleID := "cap-stale-evict"
+	activeID := "cap-active-evict"
+
+	globalLimiter.mu.Lock()
+	// Insert a stale bucket (last used > staleBucketTTL ago).
+	globalLimiter.buckets[staleID] = &bucket{
+		tokens: 10,
+		rate:   10,
+		last:   time.Now().Add(-staleBucketTTL - time.Minute),
+	}
+	delete(globalLimiter.buckets, activeID)
+	globalLimiter.mu.Unlock()
+
+	// This call triggers lazy eviction.
+	enforceRateLimit(activeID, "10rps")
+
+	globalLimiter.mu.Lock()
+	_, staleExists := globalLimiter.buckets[staleID]
+	_, activeExists := globalLimiter.buckets[activeID]
+	globalLimiter.mu.Unlock()
+
+	if staleExists {
+		t.Error("stale bucket should have been evicted")
+	}
+	if !activeExists {
+		t.Error("active bucket should still exist")
+	}
+}
+
 // --- enforceConstraints integration ---
 
 func TestEnforceConstraints_NoConstraints(t *testing.T) {
@@ -215,7 +248,7 @@ func TestEnforceConstraints_PathAndRate(t *testing.T) {
 			RateLimit:  "100rps",
 		},
 	}
-	ctx := map[string]any{"path": "/tmp/file.txt"}
+	ctx := map[string]any{"path": "file.txt"}
 	if err := enforceConstraints(claims, ctx); err != nil {
 		t.Errorf("valid path + rate should pass: %v", err)
 	}

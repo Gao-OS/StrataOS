@@ -52,26 +52,24 @@ func TestCapability_IsExpired(t *testing.T) {
 	}
 }
 
-func TestCapability_HasAction(t *testing.T) {
+func TestCapability_ActionsField(t *testing.T) {
 	cap := &Capability{
 		Actions: []string{"open", "read", "list"},
 	}
-
-	if !cap.HasAction("open") {
-		t.Error("should have action 'open'")
+	if len(cap.Actions) != 3 {
+		t.Errorf("Actions len = %d, want 3", len(cap.Actions))
 	}
-	if !cap.HasAction("read") {
-		t.Error("should have action 'read'")
-	}
-	if cap.HasAction("write") {
-		t.Error("should not have action 'write'")
+	if cap.Actions[0] != "open" {
+		t.Errorf("Actions[0] = %q, want %q", cap.Actions[0], "open")
 	}
 }
 
-func TestCapability_HasAction_Empty(t *testing.T) {
-	cap := &Capability{}
-	if cap.HasAction("anything") {
-		t.Error("empty actions should not match")
+func TestCapability_RightsField(t *testing.T) {
+	cap := &Capability{
+		Rights: []string{"fs.open", "fs.read"},
+	}
+	if len(cap.Rights) != 2 {
+		t.Errorf("Rights len = %d, want 2", len(cap.Rights))
 	}
 }
 

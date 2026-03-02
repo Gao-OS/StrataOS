@@ -24,23 +24,46 @@ type Response struct {
 }
 
 type Error struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int            `json:"code"`
+	Name    string         `json:"name"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
-// Error codes used across all Strata services.
+// Error codes and names used across all Strata services.
 const (
-	ErrInvalidRequest = 1
-	ErrAuthRequired   = 2
-	ErrPermDenied     = 3
-	ErrNotFound       = 4
-	ErrInternal       = 5
+	ErrInvalidRequest  = 1
+	ErrAuthRequired    = 2
+	ErrPermDenied      = 3
+	ErrNotFound        = 4
+	ErrInternal        = 5
+	ErrUnavailable     = 6
+	ErrResourceExhaust = 7
+	ErrConflict        = 8
 )
+
+// ErrorName maps error codes to protocol-defined names.
+var ErrorName = map[int]string{
+	ErrInvalidRequest:  "INVALID_ARGUMENT",
+	ErrAuthRequired:    "UNAUTHENTICATED",
+	ErrPermDenied:      "PERMISSION_DENIED",
+	ErrNotFound:        "NOT_FOUND",
+	ErrInternal:        "INTERNAL",
+	ErrUnavailable:     "UNAVAILABLE",
+	ErrResourceExhaust: "RESOURCE_EXHAUSTED",
+	ErrConflict:        "CONFLICT",
+}
 
 func SuccessResponse(reqID string, result any) Response {
 	return Response{V: 1, ReqID: reqID, OK: true, Result: result}
 }
 
 func ErrorResponse(reqID string, code int, msg string) Response {
-	return Response{V: 1, ReqID: reqID, OK: false, Error: &Error{Code: code, Message: msg}}
+	name := ErrorName[code]
+	return Response{V: 1, ReqID: reqID, OK: false, Error: &Error{Code: code, Name: name, Message: msg}}
+}
+
+// FullErrorResponse creates an error response with an explicit name and optional details.
+func FullErrorResponse(reqID string, code int, name, msg string, details map[string]any) Response {
+	return Response{V: 1, ReqID: reqID, OK: false, Error: &Error{Code: code, Name: name, Message: msg, Details: details}}
 }

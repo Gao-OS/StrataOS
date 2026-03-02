@@ -115,7 +115,7 @@ func extractClaims(req *ipc.Request, pubKey ed25519.PublicKey) (*capability.Capa
 // policyError converts a policy.PolicyError into an IPC error response.
 func policyError(reqID string, err error) ipc.Response {
 	if pe, ok := err.(*policy.PolicyError); ok {
-		return ipc.ErrorResponse(reqID, pe.Code, pe.Message)
+		return ipc.FullErrorResponse(reqID, pe.Code, pe.Name, pe.Message, nil)
 	}
 	return ipc.ErrorResponse(reqID, ipc.ErrInternal, err.Error())
 }

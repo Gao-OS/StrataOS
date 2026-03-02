@@ -31,9 +31,11 @@ if [ -z "$TOKEN" ]; then
 fi
 echo "  OK: token issued (cap_id=$CAP_ID)"
 
-# 3. Use token to list /tmp.
-echo "[3/6] Listing /tmp with capability token..."
-LIST_RESULT=$($CTL -token "$TOKEN" fs.list '{"path":"/tmp"}')
+# 3. Use token to list via relative path (protocol requires relative paths with path_prefix).
+echo "[3/6] Listing with capability token (relative path)..."
+LIST_RESULT=$($CTL -token "$TOKEN" fs.list '{"path":"strata-smoke"}')
+# Create the directory so listing works.
+mkdir -p /tmp/strata-smoke
 echo "$LIST_RESULT" | grep -q '"ok": *true' || {
   echo "  FAIL: fs.list returned error"
   echo "  Response: $LIST_RESULT"
@@ -44,7 +46,7 @@ echo "  OK: fs.list succeeded"
 # 4. Open and read a file via handle.
 echo "[4/6] Open + read via handle binding..."
 echo "smoke-test-data" > /tmp/strata-smoke-test.txt
-OPEN_RESULT=$($CTL -token "$TOKEN" fs.open '{"path":"/tmp/strata-smoke-test.txt"}')
+OPEN_RESULT=$($CTL -token "$TOKEN" fs.open '{"path":"strata-smoke-test.txt"}')
 HANDLE=$(echo "$OPEN_RESULT" | grep -o '"handle": *"[^"]*"' | head -1 | sed 's/.*"handle": *"//;s/"//')
 if [ -z "$HANDLE" ]; then
   echo "  FAIL: no handle returned"
@@ -66,7 +68,7 @@ echo "  OK: capability revoked"
 
 # 6. Verify revocation is enforced — fs.list must fail.
 echo "[6/6] Verifying revocation enforcement..."
-REVOKED_RESULT=$($CTL -token "$TOKEN" fs.list '{"path":"/tmp"}' 2>&1) || true
+REVOKED_RESULT=$($CTL -token "$TOKEN" fs.list '{"path":"strata-smoke"}' 2>&1) || true
 echo "$REVOKED_RESULT" | grep -q '"ok": *false' || {
   echo "  FAIL: fs.list succeeded after revocation (expected denial)"
   exit 1
@@ -77,6 +79,8 @@ echo "$REVOKED_RESULT" | grep -q "revoked" || {
   exit 1
 }
 echo "  OK: fs.list denied after revocation"
+
+rm -rf /tmp/strata-smoke
 
 echo ""
 echo "=== Smoke Test PASSED ==="

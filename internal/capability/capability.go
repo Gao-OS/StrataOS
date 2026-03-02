@@ -46,11 +46,3 @@ func (c *Capability) IsExpired() bool {
 	return time.Now().After(c.ExpiresAt)
 }
 
-func (c *Capability) HasAction(action string) bool {
-	for _, a := range c.Actions {
-		if a == action {
-			return true
-		}
-	}
-	return false
-}
