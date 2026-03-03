@@ -15,15 +15,16 @@ These hold across all Strata services and must not be violated:
 ## Practical Boundaries
 
 - Strata does not implement a filesystem format; it mediates access to Linux FS.
-- Strata does not replace systemd; supervisor is logical runtime kernel, systemd is last-resort PID1 supervisor.
+- Strata does not replace systemd; supervisor is logical runtime kernel, systemd is last-resort PID1 supervisor. Supervisor manages services via a state machine (7 states: Declared, Starting, Healthy, Crashed, Restarting, Stopped, Quarantined) with exponential backoff crash recovery.
 - Cluster is staged; do not implement distributed consensus early.
 - No ambient authority: services start with minimal privileges and acquire capabilities explicitly.
+- Services are auto-registered in the registry when healthy; the CLI resolves endpoints via registry before falling back to socket convention.
 
 ## Naming Conventions
 
 | Entity          | Convention                | Example                  |
 |-----------------|---------------------------|--------------------------|
-| Go packages     | lowercase, single word    | `ipc`, `auth`, `policy`  |
+| Go packages     | lowercase, single word    | `ipc`, `auth`, `policy`, `supervisor`, `registry` |
 | Binaries        | lowercase, hyphenated     | `strata-ctl`             |
 | IPC methods     | `service.action`          | `fs.open`, `identity.issue` |
 | Error names     | `UPPER_SNAKE_CASE`        | `PERMISSION_DENIED`      |

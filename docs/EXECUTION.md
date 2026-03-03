@@ -25,8 +25,8 @@ This document describes how we develop Strata step-by-step without losing contro
 
 Recommended structure (current baseline):
 
-- `cmd/*`: binaries
-- `internal/*`: shared libraries (ipc/auth/capability/policy/service/registry)
+- `cmd/*`: binaries (supervisor, registry, identity, fs, strata-ctl)
+- `internal/*`: shared libraries (ipc/auth/capability/policy/supervisor/registry)
 - `api/protocol.md`: protocol source of truth
 - `modules/strata.nix`: NixOS module scaffold
 - `flake.nix`, `devenv.nix`: build/dev
@@ -45,6 +45,7 @@ Recommended structure (current baseline):
 - `nix build .#supervisor`
 - `nix build .#identity`
 - `nix build .#fs`
+- `nix build .#registry`
 - (optional) `nix flake check`
 
 ### Manual
@@ -67,9 +68,12 @@ sh scripts/smoke.sh
 
 Every iteration must prove these:
 
-1) issue token
-2) list or read file via fs
-3) revoke token → access denied (once revocation enforcement is implemented)
+1) supervisor.status responds
+2) supervisor.svc.list shows services
+3) registry.list / registry.resolve work
+4) issue token
+5) list or read file via fs
+6) revoke token → access denied
 
 If a step doesn't preserve these, revert or fix before continuing.
 
@@ -120,17 +124,16 @@ Acceptance:
 
 ---
 
-### Phase 4 — Supervisor State Machine (v0.3.2)
+### Phase 4 — Supervisor State Machine (v0.3.2) ✅
 **Objective:** Supervisor becomes runtime kernel.
 
 Tasks:
-- Add `internal/service/*` state + lifecycle
-- Implement:
-  - `supervisor.svc.list`
-  - `supervisor.svc.start`
-  - `supervisor.svc.stop`
-- Crash restart with exponential backoff
-- Optional quarantine threshold
+- [x] Add `internal/supervisor/` — state machine (7 states), backoff, quarantine, Manager
+- [x] Implement `supervisor.svc.list`, `supervisor.svc.start`, `supervisor.svc.stop`
+- [x] Crash restart with exponential backoff (1s→30s cap)
+- [x] Quarantine threshold (5 crashes in 2 minutes)
+- [x] Dependency-ordered startup via topological sort
+- [x] Rewrite `cmd/supervisor/main.go` to use Manager
 
 Acceptance:
 - Killing a service process triggers restart
@@ -138,14 +141,14 @@ Acceptance:
 
 ---
 
-### Phase 5 — Registry Service (v0.3.2)
+### Phase 5 — Registry Service (v0.3.2) ✅
 **Objective:** Add local service discovery to enable future cluster.
 
 Tasks:
-- Implement `cmd/registry` (memory store)
-- Implement `registry.register/resolve/list`
-- Supervisor registers identity/fs/registry on startup
-- CLI resolves endpoints via registry (fallback to defaults allowed)
+- [x] Implement `internal/registry/` (thread-safe in-memory store)
+- [x] Implement `cmd/registry/` with `registry.register/resolve/list`
+- [x] Supervisor auto-registers services via `onHealthy` callback
+- [x] CLI resolves endpoints via registry (fallback to socket convention)
 
 Acceptance:
 - CLI can resolve services and call them without hardcoded socket paths

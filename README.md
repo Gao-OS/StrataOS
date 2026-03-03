@@ -6,34 +6,42 @@ Strata implements a logical microkernel/exokernel-style control layer on top of 
 namespaces, cgroups, and systemd. It is **not** a Linux replacement, not an AI orchestration
 system, and not a monolithic application. It is a distributed capability-based service runtime.
 
-**Version:** 0.3.0-mvp1
+**Version:** 0.3.2
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│            Supervisor               │
-│  (lifecycle, control socket)        │
-│                                     │
-│  ┌──────────┐    ┌──────────┐       │
-│  │ Identity │    │    FS    │       │
-│  │ (tokens) │    │ (files)  │       │
-│  └────┬─────┘    └────┬─────┘       │
-│       │               │             │
-│  identity.sock     fs.sock          │
-└───────┴───────────────┴─────────────┘
-        Unix Domain Sockets
-        Length-prefixed JSON
+┌───────────────────────────────────────────────┐
+│                 Supervisor                     │
+│  (Manager state machine, crash recovery,      │
+│   backoff, quarantine, control socket)         │
+│                                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │ Registry │  │ Identity │  │    FS    │    │
+│  │(discover)│  │ (tokens) │  │ (files)  │    │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘    │
+│       │              │             │           │
+│  registry.sock  identity.sock   fs.sock       │
+└───────┴──────────────┴─────────────┴───────────┘
+          Unix Domain Sockets
+          Length-prefixed JSON
 ```
 
-- **Supervisor** starts and manages identity and fs as child processes, handles graceful shutdown (SIGINT/SIGTERM)
+- **Supervisor** manages all services via a state machine with dependency-ordered startup (topological sort), exponential backoff crash recovery, and sliding window quarantine. Exposes `supervisor.status`, `supervisor.svc.list`, `supervisor.svc.start`, `supervisor.svc.stop`
+- **Registry** provides in-memory service endpoint discovery (`registry.register`, `registry.resolve`, `registry.list`). No auth required (socket-level trust)
 - **Identity** generates an ed25519 keypair, issues PASETO v2.public capability tokens, maintains an in-memory revocation list
 - **FS** provides capability-gated filesystem operations (open, read, list), verifies tokens locally using identity's public key, enforces path prefix constraints via centralized policy
-- **strata-ctl** is the CLI client; it infers the target socket from the method prefix (e.g., `fs.open` → `fs.sock`)
+- **strata-ctl** is the CLI client; resolves target sockets via registry with fallback to convention
+
+### Service Lifecycle States
+
+`Declared` → `Starting` → `Healthy` → `Crashed` → `Restarting` → (back to Starting)
+
+A service that crashes too many times within a window is `Quarantined` and requires manual restart. `Stopped` services can be restarted via `supervisor.svc.start`.
 
 ### Startup Sequence
 
-Supervisor → starts identity → waits for `identity.pub` → starts fs (loads public key) → opens control socket.
+Supervisor → starts registry (no deps) → starts identity (no deps) → waits for `identity.pub` → starts fs (depends on identity) → opens control socket. Healthy services are auto-registered in registry.
 
 ### Authorization Model
 
@@ -49,6 +57,7 @@ All protected handlers call `policy.Authorize(claims, method, ctx)` — deny-by-
 nix build .#supervisor
 nix build .#identity
 nix build .#fs
+nix build .#registry
 nix build .#strata-ctl
 ```
 
@@ -58,7 +67,7 @@ nix build .#strata-ctl
 go build -o ./bin/ ./cmd/...
 ```
 
-Produces: `./bin/supervisor`, `./bin/identity`, `./bin/fs`, `./bin/strata-ctl`
+Produces: `./bin/supervisor`, `./bin/identity`, `./bin/fs`, `./bin/registry`, `./bin/strata-ctl`
 
 ### OS Images
 
@@ -103,8 +112,8 @@ mkdir -p $STRATA_RUNTIME_DIR
 ./bin/supervisor
 ```
 
-The supervisor finds `identity` and `fs` binaries in the same directory as itself.
-Override with `STRATA_IDENTITY_BIN` and `STRATA_FS_BIN` environment variables.
+The supervisor finds `registry`, `identity`, and `fs` binaries in the same directory as itself.
+Override with `STRATA_REGISTRY_BIN`, `STRATA_IDENTITY_BIN`, and `STRATA_FS_BIN` environment variables.
 
 ## Usage Examples
 
@@ -163,9 +172,33 @@ echo "hello strata" > /tmp/test.txt
 ./bin/strata-ctl supervisor.status
 ```
 
+### 5. List managed services
+
+```sh
+./bin/strata-ctl supervisor.svc.list
+```
+
+### 6. Resolve a service via registry
+
+```sh
+./bin/strata-ctl registry.resolve '{"service":"fs"}'
+```
+
+### 7. List all registered services
+
+```sh
+./bin/strata-ctl registry.list
+```
+
 ## Testing
 
 ```sh
+# Run unit tests
+go test ./internal/...
+
+# Run with race detector
+go test -race ./internal/...
+
 # Run smoke test (with supervisor running in another terminal)
 sh scripts/smoke.sh
 ```
@@ -184,6 +217,7 @@ A scaffold NixOS module is provided at `modules/strata.nix`:
     package = strataOS.packages.x86_64-linux.supervisor;
     identityPackage = strataOS.packages.x86_64-linux.identity;
     fsPackage = strataOS.packages.x86_64-linux.fs;
+    registryPackage = strataOS.packages.x86_64-linux.registry;
   };
 }
 ```
@@ -209,7 +243,8 @@ Error codes:
 
 ```
 cmd/
-  supervisor/    Node-local process supervisor
+  supervisor/    Node-local process supervisor (Manager state machine)
+  registry/      In-memory service endpoint registry
   identity/      Capability token issuer (PASETO v2.public)
   fs/            Capability-gated filesystem service
   strata-ctl/    CLI client for interacting with services
@@ -218,6 +253,8 @@ internal/
   auth/          Ed25519 keys, PASETO signing/verification, revocation
   capability/    Token claims and constraint types
   policy/        Centralized authorization and constraint enforcement
+  supervisor/    Service lifecycle state machine, backoff, quarantine, Manager
+  registry/      Thread-safe in-memory service registry
 modules/
   strata.nix     NixOS module scaffold
 api/

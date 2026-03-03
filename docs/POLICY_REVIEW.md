@@ -15,7 +15,7 @@ and `internal/ipc/types.go`.
 | 5 | Security best practices | **PASS w/ issue** |
 | 6 | Concurrency & safety | **PASS** |
 | 7 | Maintainability | **PASS** |
-| 8 | Test coverage | **FAIL** |
+| 8 | Test coverage | **PASS** (96 tests) |
 | 9 | Audit logging hooks | **FAIL** |
 | 10 | Diff-specific checks | **PASS w/ issue** |
 | 11 | Error handling consistency | **PASS w/ issue** |
@@ -158,29 +158,16 @@ Lock discipline is correct: `RLock` for read-only paths (`Get`, `IsRevoked`), `L
 
 ---
 
-## 8. Test Coverage — FAIL
+## 8. Test Coverage — PASS
 
-**No test files exist.** `**/*_test.go` returns zero results across the entire repository.
+**96 unit tests** across 6 packages, all passing with `-race`:
 
-### Required tests (priority order):
-
-1. **`internal/policy/` tests** (highest priority):
-   - `Authorize()`: nil claims, wrong service, missing right, missing action, rights-preferred-over-actions, both rights+actions present
-   - `enforcePathPrefix()`: `..` rejection, prefix boundary (`/tmp` vs `/tmpevil`), empty prefix (pass-through), empty path (pass-through), absolute paths
-   - `enforceRateLimit()`: basic exhaustion, token refill over time, malformed rate string, empty rate string, per-cap isolation
-
-2. **`internal/auth/` tests**:
-   - PASETO sign/verify round-trip
-   - Verify with wrong key → error
-   - Tampered token → error
-   - Expired token detection
-
-3. **Handle table tests** (integration-level):
-   - Open returns valid handle
-   - Get with invalid handle → not found
-   - Cross-capability binding check
-   - Revoke → IsRevoked returns true
-   - Concurrent open/read/revoke (race detector)
+- `internal/policy/` — Authorize (nil claims, wrong service, missing right/action, rights vs actions), enforcePathPrefix (traversal, boundaries, absolutes), enforceRateLimit (exhaustion, refill, malformed, per-cap isolation)
+- `internal/auth/` — PASETO sign/verify round-trip, wrong key, tampered token, expired detection, revocation list
+- `internal/capability/` — NewCapability, expiration
+- `internal/ipc/` — framing, request/response serialization
+- `internal/supervisor/` — state transitions (valid/invalid), backoff computation, quarantine threshold, Manager (declare, topo sort, cycle detection, unknown deps, crash handling, dependency enforcement)
+- `internal/registry/` — register/resolve/list/remove, overwrite, concurrent access
 
 ---
 
@@ -299,7 +286,7 @@ Hook into:
 | 3c | **Medium** | `policy/constraints.go:27-68` | Absolute paths accepted; protocol requires relative-only | Reject paths starting with `/` in `enforcePathPrefix` |
 | 4a | **Medium** | `cmd/fs/main.go:268-276` | `fs.revoke` handler has no caller authentication | Add `SO_PEERCRED` check or shared internal secret |
 | 5a | Low | `capability/capability.go:49-56` | `HasAction()` is dead code | Delete it |
-| 8 | **High** | N/A | Zero test files in entire repository | Add unit tests: policy → constraints → auth → handles |
+| 8 | ~~High~~ **RESOLVED** | N/A | ~~Zero test files~~ 96 tests across 6 packages | Resolved in v0.3.1 and v0.3.2 |
 | 9 | **Medium** | N/A | No structured audit events; `auth.denied` never emitted | Create `internal/audit/` with structured JSON events |
 | 10a | **Medium** | `ipc/types.go:26-29` | `ipc.Error` missing `name`/`details` per protocol v0.3.1 | Add fields to struct, update `ErrorResponse` helper |
 | 11a | Low | `cmd/identity/main.go:108-115` | Revocation notify is fire-and-forget | Persist revocations or add retry/sync mechanism |
