@@ -11,7 +11,7 @@
       systemOutputs = flake-utils.lib.eachDefaultSystem (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          version = "0.3.0-mvp1";
+          version = "0.3.2";
           src = ./.;
         in {
           packages = {
@@ -33,6 +33,13 @@
               pname = "strata-fs";
               inherit version src;
               subPackages = [ "cmd/fs" ];
+              vendorHash = null;
+            };
+
+            registry = pkgs.buildGoModule {
+              pname = "strata-registry";
+              inherit version src;
+              subPackages = [ "cmd/registry" ];
               vendorHash = null;
             };
 
@@ -77,6 +84,7 @@
               package = self.packages.${system}.supervisor;
               identityPackage = self.packages.${system}.identity;
               fsPackage = self.packages.${system}.fs;
+              registryPackage = self.packages.${system}.registry;
             };
 
             # Minimal configuration for live images/VMs

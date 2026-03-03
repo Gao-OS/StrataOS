@@ -37,6 +37,11 @@ in
       type = types.package;
       description = "The strata-fs package to use.";
     };
+
+    registryPackage = mkOption {
+      type = types.package;
+      description = "The strata-registry package to use.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -50,6 +55,7 @@ in
         STRATA_NODE_ID = cfg.nodeId;
         STRATA_IDENTITY_BIN = "${cfg.identityPackage}/bin/identity";
         STRATA_FS_BIN = "${cfg.fsPackage}/bin/fs";
+        STRATA_REGISTRY_BIN = "${cfg.registryPackage}/bin/registry";
       };
 
       serviceConfig = {

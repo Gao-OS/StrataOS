@@ -1,9 +1,10 @@
 // Supervisor: top-level process that manages the Strata service lifecycle.
-// Starts identity and fs as child processes, creates the runtime directory,
-// and exposes a stub control socket.
+// Uses the Manager state machine for dependency-ordered startup, crash recovery,
+// and quarantine. Exposes IPC control methods on supervisor.sock.
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Gao-OS/StrataOS/internal/ipc"
+	"github.com/Gao-OS/StrataOS/internal/supervisor"
 )
 
 func main() {
@@ -22,62 +24,155 @@ func main() {
 	if runtimeDir == "" {
 		runtimeDir = "/run/strata"
 	}
+	nodeID := os.Getenv("STRATA_NODE_ID")
+	if nodeID == "" {
+		nodeID = "local-0"
+	}
 
-	log.Printf("[supervisor] starting (runtime_dir=%s)", runtimeDir)
+	log.Printf("[supervisor] starting (runtime_dir=%s, node_id=%s)", runtimeDir, nodeID)
 
 	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
 		log.Fatalf("[supervisor] create runtime dir: %v", err)
 	}
 
-	// Start identity first — it publishes its public key for other services.
+	// Registry socket path for onHealthy registration.
+	registrySock := filepath.Join(runtimeDir, "registry.sock")
+
+	mgr := supervisor.NewManager(supervisor.ManagerConfig{
+		RuntimeDir: runtimeDir,
+		NodeID:     nodeID,
+		Backoff:    supervisor.DefaultBackoff(),
+		Quarantine: supervisor.DefaultQuarantine(),
+		OnHealthy: func(name string) {
+			// Auto-register healthy services in the registry (fire-and-forget).
+			// Skip registry itself to avoid circular dependency.
+			if name == "registry" {
+				return
+			}
+			endpoint := fmt.Sprintf("unix://%s", filepath.Join(runtimeDir, name+".sock"))
+			go registerInRegistry(registrySock, name, endpoint)
+		},
+	})
+
+	// Locate and declare services.
+	registryBin, err := findServiceBinary("registry")
+	if err != nil {
+		log.Fatalf("[supervisor] %v", err)
+	}
 	identityBin, err := findServiceBinary("identity")
 	if err != nil {
 		log.Fatalf("[supervisor] %v", err)
 	}
-	identityCmd := startService("identity", identityBin, runtimeDir)
-
-	identitySock := filepath.Join(runtimeDir, "identity.sock")
-	if !waitForFile(identitySock, 5*time.Second) {
-		log.Fatalf("[supervisor] identity service did not start (waiting for %s)", identitySock)
-	}
-	log.Printf("[supervisor] identity service ready")
-
-	// Start fs after identity's public key is available.
 	fsBin, err := findServiceBinary("fs")
 	if err != nil {
 		log.Fatalf("[supervisor] %v", err)
 	}
-	fsCmd := startService("fs", fsBin, runtimeDir)
 
-	fsSock := filepath.Join(runtimeDir, "fs.sock")
-	if !waitForFile(fsSock, 5*time.Second) {
-		log.Fatalf("[supervisor] fs service did not start (waiting for %s)", fsSock)
+	mgr.Declare(supervisor.ServiceConfig{
+		Name:         "registry",
+		BinaryPath:   registryBin,
+		SocketName:   "registry.sock",
+		ReadyTimeout: 5 * time.Second,
+	})
+	mgr.Declare(supervisor.ServiceConfig{
+		Name:         "identity",
+		BinaryPath:   identityBin,
+		SocketName:   "identity.sock",
+		ReadyTimeout: 5 * time.Second,
+	})
+	mgr.Declare(supervisor.ServiceConfig{
+		Name:         "fs",
+		BinaryPath:   fsBin,
+		SocketName:   "fs.sock",
+		DependsOn:    []string{"identity"},
+		ReadyTimeout: 5 * time.Second,
+	})
+
+	if err := mgr.StartAll(); err != nil {
+		log.Fatalf("[supervisor] %v", err)
 	}
-	log.Printf("[supervisor] fs service ready")
 
-	// Stub control socket.
+	// Control socket.
 	ctlSrv := ipc.NewServer(filepath.Join(runtimeDir, "supervisor.sock"))
+
 	ctlSrv.Handle("supervisor.status", func(req *ipc.Request) ipc.Response {
-		return ipc.SuccessResponse(req.ReqID, map[string]string{
-			"status":   "running",
-			"identity": "running",
-			"fs":       "running",
+		return ipc.SuccessResponse(req.ReqID, mgr.Status())
+	})
+
+	ctlSrv.Handle("supervisor.svc.list", func(req *ipc.Request) ipc.Response {
+		return ipc.SuccessResponse(req.ReqID, map[string]any{
+			"services": mgr.ListServices(),
 		})
 	})
+
+	ctlSrv.Handle("supervisor.svc.start", func(req *ipc.Request) ipc.Response {
+		name, _ := req.Params["name"].(string)
+		if name == "" {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing name param")
+		}
+		if err := mgr.StartService(name); err != nil {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInternal, err.Error())
+		}
+		return ipc.SuccessResponse(req.ReqID, map[string]string{"status": "started"})
+	})
+
+	ctlSrv.Handle("supervisor.svc.stop", func(req *ipc.Request) ipc.Response {
+		name, _ := req.Params["name"].(string)
+		if name == "" {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest, "missing name param")
+		}
+		drainMs := 2000
+		if d, ok := req.Params["drain_ms"].(float64); ok && d > 0 {
+			drainMs = int(d)
+		}
+		if err := mgr.StopService(name, drainMs); err != nil {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInternal, err.Error())
+		}
+		return ipc.SuccessResponse(req.ReqID, map[string]string{"status": "stopped"})
+	})
+
 	if err := ctlSrv.Start(); err != nil {
 		log.Fatalf("[supervisor] control socket: %v", err)
 	}
 
 	log.Printf("[supervisor] all services running")
 
+	// Crash recovery loop in background.
+	ctx, cancel := context.WithCancel(context.Background())
+	go mgr.Run(ctx)
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
 	log.Printf("[supervisor] shutting down")
+	cancel()
 	ctlSrv.Stop()
-	stopService(fsCmd, "fs")
-	stopService(identityCmd, "identity")
+	mgr.StopAll()
+}
+
+// registerInRegistry sends a registry.register request (fire-and-forget).
+func registerInRegistry(registrySock, service, endpoint string) {
+	req := &ipc.Request{
+		V:      1,
+		ReqID:  fmt.Sprintf("register-%s", service),
+		Method: "registry.register",
+		Params: map[string]any{
+			"service":  service,
+			"endpoint": endpoint,
+			"api_v":    1,
+		},
+	}
+	resp, err := ipc.SendRequest(registrySock, req)
+	if err != nil {
+		log.Printf("[supervisor] failed to register %s in registry: %v", service, err)
+		return
+	}
+	if !resp.OK {
+		log.Printf("[supervisor] registry rejected %s: %s", service, resp.Error.Message)
+		return
+	}
+	log.Printf("[supervisor] registered %s in registry", service)
 }
 
 // findServiceBinary locates a service binary by checking:
@@ -99,35 +194,4 @@ func findServiceBinary(name string) (string, error) {
 		return p, nil
 	}
 	return "", fmt.Errorf("binary %q not found (set STRATA_%s_BIN)", name, strings.ToUpper(name))
-}
-
-func startService(name, bin, runtimeDir string) *exec.Cmd {
-	cmd := exec.Command(bin)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("STRATA_RUNTIME_DIR=%s", runtimeDir))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("[supervisor] start %s: %v", name, err)
-	}
-	log.Printf("[supervisor] started %s (pid=%d)", name, cmd.Process.Pid)
-	return cmd
-}
-
-func stopService(cmd *exec.Cmd, name string) {
-	if cmd.Process != nil {
-		log.Printf("[supervisor] stopping %s (pid=%d)", name, cmd.Process.Pid)
-		cmd.Process.Signal(syscall.SIGTERM)
-		cmd.Wait()
-	}
-}
-
-func waitForFile(path string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false
 }

@@ -2,13 +2,12 @@
 // Sends a single IPC request and prints the JSON response.
 //
 // Usage:
-//   strata-ctl <method> [params_json]
-//   strata-ctl -token <TOKEN> <method> [params_json]
 //
-// The target socket is inferred from the method prefix:
-//   identity.* → identity.sock
-//   fs.*       → fs.sock
-//   supervisor.* → supervisor.sock
+//	strata-ctl <method> [params_json]
+//	strata-ctl -token <TOKEN> <method> [params_json]
+//
+// The target socket is resolved via the registry service when available,
+// with fallback to the convention: method prefix → service.sock.
 package main
 
 import (
@@ -16,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,9 +66,7 @@ func main() {
 		}
 	}
 
-	// Derive socket path from method prefix (e.g. "fs.open" → "fs.sock").
-	service := strings.SplitN(method, ".", 2)[0]
-	socketPath := filepath.Join(runtimeDir, service+".sock")
+	socketPath := resolveSocket(runtimeDir, method)
 
 	idBytes := make([]byte, 8)
 	rand.Read(idBytes)
@@ -95,4 +93,54 @@ func main() {
 	if !resp.OK {
 		os.Exit(1)
 	}
+}
+
+// resolveSocket determines the target socket for a method.
+// For registry.* and supervisor.* methods, uses direct convention (can't resolve themselves).
+// For other methods, tries registry.resolve first, then falls back to convention.
+func resolveSocket(runtimeDir, method string) string {
+	service := strings.SplitN(method, ".", 2)[0]
+
+	// Self-referential services can't use the registry to resolve themselves.
+	if service == "registry" || service == "supervisor" {
+		return filepath.Join(runtimeDir, service+".sock")
+	}
+
+	// Try registry resolution.
+	registrySock := filepath.Join(runtimeDir, "registry.sock")
+	endpoint, err := registryResolve(registrySock, service)
+	if err == nil && endpoint != "" {
+		// Parse "unix:///path" → "/path"
+		if strings.HasPrefix(endpoint, "unix://") {
+			return strings.TrimPrefix(endpoint, "unix://")
+		}
+		return endpoint
+	}
+
+	// Fallback to socket convention.
+	log.Printf("[strata-ctl] registry unavailable, using convention for %s", service)
+	return filepath.Join(runtimeDir, service+".sock")
+}
+
+// registryResolve calls registry.resolve and returns the endpoint.
+func registryResolve(registrySock, service string) (string, error) {
+	req := &ipc.Request{
+		V:      1,
+		ReqID:  "resolve-" + service,
+		Method: "registry.resolve",
+		Params: map[string]any{"service": service},
+	}
+	resp, err := ipc.SendRequest(registrySock, req)
+	if err != nil {
+		return "", err
+	}
+	if !resp.OK {
+		return "", fmt.Errorf("resolve failed: %s", resp.Error.Message)
+	}
+	result, ok := resp.Result.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("unexpected result type")
+	}
+	endpoint, _ := result["endpoint"].(string)
+	return endpoint, nil
 }

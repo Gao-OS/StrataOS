@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Strata is a NixOS-native, capability-oriented distributed runtime substrate. It implements a logical microkernel/exokernel-style control layer on top of Linux namespaces, cgroups, and systemd. **Not** an AI system, not a Linux replacement — a distributed capability-based service runtime.
 
-Current version: **v0.3.0-mvp1** (node-local only, no cluster logic).
+Current version: **v0.3.2** (node-local with supervisor state machine and registry).
 
 ## Build & Run
 
@@ -14,7 +14,7 @@ Current version: **v0.3.0-mvp1** (node-local only, no cluster logic).
 # Build all binaries
 go build -o ./bin/ ./cmd/...
 
-# Run (starts supervisor → identity → fs)
+# Run (starts supervisor → registry → identity → fs)
 export STRATA_RUNTIME_DIR=/tmp/strata
 mkdir -p $STRATA_RUNTIME_DIR
 ./bin/supervisor
@@ -23,6 +23,7 @@ mkdir -p $STRATA_RUNTIME_DIR
 nix build .#supervisor
 nix build .#identity
 nix build .#fs
+nix build .#registry
 nix build .#strata-ctl
 
 # NixOS images
@@ -79,16 +80,17 @@ go vet ./...                   # built-in static checks
 
 ## Architecture
 
-Three services managed by a supervisor, communicating over Unix domain sockets with length-prefixed JSON (4-byte big-endian header + JSON payload, max 1 MiB frame):
+Four services managed by a supervisor, communicating over Unix domain sockets with length-prefixed JSON (4-byte big-endian header + JSON payload, max 1 MiB frame):
 
-- **Supervisor** (`cmd/supervisor/`) — starts identity and fs as child processes, exposes stub control socket, handles graceful shutdown (SIGINT/SIGTERM)
+- **Supervisor** (`cmd/supervisor/`) — uses Manager state machine for dependency-ordered startup, crash recovery with exponential backoff, quarantine for repeatedly crashing services, exposes control methods (`supervisor.status`, `supervisor.svc.list`, `supervisor.svc.start`, `supervisor.svc.stop`)
+- **Registry** (`cmd/registry/`) — in-memory service endpoint registry, no auth required (socket-level trust); methods: `registry.register`, `registry.resolve`, `registry.list`
 - **Identity** (`cmd/identity/`) — generates ed25519 keypair at startup, issues PASETO v2.public capability tokens, maintains in-memory revocation list, propagates revocations to FS (fire-and-forget)
 - **FS** (`cmd/fs/`) — capability-gated file operations (open/read/list), verifies tokens locally using identity's published public key, maintains handle table bound to cap_ids, enforces `path_prefix` constraints via centralized policy
-- **strata-ctl** (`cmd/strata-ctl/`) — CLI client, infers target socket from method prefix (e.g., `fs.open` → `fs.sock`)
+- **strata-ctl** (`cmd/strata-ctl/`) — CLI client, resolves target socket via registry (fallback to convention)
 
 ### Startup sequence
 
-Supervisor → starts identity → waits for `identity.pub` file → starts fs (which loads the public key) → opens control socket.
+Supervisor → starts registry (no deps) → starts identity (no deps) → waits for `identity.pub` → starts fs (depends on identity) → opens control socket. Healthy services are auto-registered in registry via `onHealthy` callback.
 
 ### Key Internal Packages
 
@@ -96,6 +98,8 @@ Supervisor → starts identity → waits for `identity.pub` file → starts fs (
 - `internal/auth` — ed25519 key generation, PASETO v2.public sign/verify (stdlib-only PAE implementation), `RevocationList` (thread-safe, in-memory)
 - `internal/capability` — `Capability` struct with `Rights` (preferred, fully-qualified like `fs.open`) and `Actions` (legacy fallback), `Constraints` (path_prefix, rate_limit)
 - `internal/policy` — `Authorize(claims, method, ctx)` is the single authorization checkpoint; enforces service match, rights/actions, path prefix (with traversal protection), rate limiting (token bucket per cap_id)
+- `internal/supervisor` — service lifecycle state machine (7 states), exponential backoff, sliding window quarantine, Manager orchestrator with dependency-ordered startup and crash recovery
+- `internal/registry` — thread-safe in-memory service registry (Register/Resolve/List/Remove)
 
 ### Authorization Flow
 
@@ -112,13 +116,13 @@ Full spec: `api/protocol.md`
 ## Runtime Layout
 
 All sockets and state under `STRATA_RUNTIME_DIR` (default `/run/strata`, use `/tmp/strata` for dev):
-- `supervisor.sock`, `identity.sock`, `fs.sock` — IPC sockets
+- `supervisor.sock`, `registry.sock`, `identity.sock`, `fs.sock` — IPC sockets
 - `identity.pub` — base64-encoded ed25519 public key (written by identity, read by fs)
 
 ## Conventions
 
 - Go stdlib only — no external dependencies (`vendorHash = null` in Nix)
-- No global state; config via environment variables (`STRATA_RUNTIME_DIR`, `STRATA_IDENTITY_BIN`, `STRATA_FS_BIN`, `STRATA_NODE_ID`)
+- No global state; config via environment variables (`STRATA_RUNTIME_DIR`, `STRATA_IDENTITY_BIN`, `STRATA_FS_BIN`, `STRATA_REGISTRY_BIN`, `STRATA_NODE_ID`)
 - No persistent state at MVP — all in-memory, lost on restart
 - `cmd/` for binaries, `internal/` for shared libraries
 - PASETO v2.public over JWT (prevents algorithm confusion attacks)
@@ -132,6 +136,6 @@ All sockets and state under `STRATA_RUNTIME_DIR` (default `/run/strata`, use `/t
 
 ## Roadmap Reference
 
-See `docs/PLAN.md` for the full roadmap. Current position: v0.3.1 (policy layer) mostly complete. Next: v0.3.2 (supervisor state machine, registry service), v0.3.3 (NixOS activation), v0.4 (distributed hooks).
+See `docs/PLAN.md` for the full roadmap. Current position: v0.3.2 (supervisor state machine, registry service) complete. Next: v0.3.3 (NixOS activation), v0.4 (distributed hooks).
 
-Known issues tracked in `docs/POLICY_REVIEW.md`: rate limiter memory leak, missing unit tests, fs.revoke lacks caller authentication, audit logging not implemented.
+Known issues tracked in `docs/POLICY_REVIEW.md`: rate limiter memory leak, fs.revoke lacks caller authentication, audit logging not implemented.

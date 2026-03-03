@@ -112,14 +112,14 @@ Key invariants:
 - [ ] revoked cap invalidates existing handles
 
 ### M4: Supervisor State Machine (v0.3.2)
-- [ ] service states tracked
-- [ ] restart/backoff policy works
-- [ ] supervisor control methods exist
+- [x] service states tracked
+- [x] restart/backoff policy works
+- [x] supervisor control methods exist
 
 ### M5: Registry (v0.3.2)
-- [ ] registry service exists
-- [ ] supervisor registers services
-- [ ] CLI resolves endpoints via registry
+- [x] registry service exists
+- [x] supervisor registers services
+- [x] CLI resolves endpoints via registry
 
 ### M6: NixOS Module (v0.3.3)
 - [ ] module enables systemd unit
