@@ -124,8 +124,9 @@ func TestHandleCrash_Quarantine(t *testing.T) {
 	})
 	m.Declare(ServiceConfig{Name: "svc", BinaryPath: "/bin/true", SocketName: "svc.sock"})
 	se := m.services["svc"]
-	se.State = Healthy
 
+	se.mu.Lock()
+	se.State = Healthy
 	// Simulate rapid crashes up to quarantine threshold.
 	now := time.Now()
 	se.CrashWindow = []time.Time{
@@ -133,6 +134,7 @@ func TestHandleCrash_Quarantine(t *testing.T) {
 		now.Add(-15 * time.Second),
 	}
 	se.CrashCount = 2
+	se.mu.Unlock()
 
 	// This crash should trigger quarantine (3rd crash within window).
 	m.handleCrash("svc")
@@ -140,8 +142,11 @@ func TestHandleCrash_Quarantine(t *testing.T) {
 	// Give time.AfterFunc a moment (it shouldn't fire for quarantine).
 	time.Sleep(50 * time.Millisecond)
 
-	if se.State != Quarantined {
-		t.Errorf("expected Quarantined, got %s", se.State)
+	se.mu.Lock()
+	state := se.State
+	se.mu.Unlock()
+	if state != Quarantined {
+		t.Errorf("expected Quarantined, got %s", state)
 	}
 }
 
@@ -152,16 +157,73 @@ func TestHandleCrash_Restarting(t *testing.T) {
 	})
 	m.Declare(ServiceConfig{Name: "svc", BinaryPath: "/bin/true", SocketName: "svc.sock"})
 	se := m.services["svc"]
+
+	se.mu.Lock()
 	se.State = Healthy
+	se.mu.Unlock()
 
 	m.handleCrash("svc")
 
+	se.mu.Lock()
+	state := se.State
+	crashCount := se.CrashCount
+	se.mu.Unlock()
+
 	// Should transition to Restarting (not Quarantined, since under threshold).
-	if se.State != Restarting {
-		t.Errorf("expected Restarting, got %s", se.State)
+	if state != Restarting {
+		t.Errorf("expected Restarting, got %s", state)
 	}
-	if se.CrashCount != 1 {
-		t.Errorf("expected CrashCount=1, got %d", se.CrashCount)
+	if crashCount != 1 {
+		t.Errorf("expected CrashCount=1, got %d", crashCount)
+	}
+}
+
+func TestHandleCrash_Stopped(t *testing.T) {
+	m := NewManager(ManagerConfig{RuntimeDir: "/tmp/test-strata"})
+	m.Declare(ServiceConfig{Name: "svc", BinaryPath: "/bin/true", SocketName: "svc.sock"})
+	se := m.services["svc"]
+
+	se.mu.Lock()
+	se.State = Stopped
+	se.mu.Unlock()
+
+	// Should not change state when already stopped.
+	m.handleCrash("svc")
+
+	se.mu.Lock()
+	state := se.State
+	se.mu.Unlock()
+	if state != Stopped {
+		t.Errorf("expected Stopped, got %s", state)
+	}
+}
+
+func TestHandleCrash_PrunesCrashWindow(t *testing.T) {
+	m := NewManager(ManagerConfig{
+		RuntimeDir: "/tmp/test-strata",
+		Quarantine: QuarantineConfig{MaxCrashes: 10, Window: time.Minute},
+	})
+	m.Declare(ServiceConfig{Name: "svc", BinaryPath: "/bin/true", SocketName: "svc.sock"})
+	se := m.services["svc"]
+
+	se.mu.Lock()
+	se.State = Healthy
+	// Add old crash entries that should be pruned.
+	se.CrashWindow = []time.Time{
+		time.Now().Add(-10 * time.Minute),
+		time.Now().Add(-5 * time.Minute),
+	}
+	se.mu.Unlock()
+
+	m.handleCrash("svc")
+
+	se.mu.Lock()
+	windowLen := len(se.CrashWindow)
+	se.mu.Unlock()
+
+	// Old entries pruned, only the new crash should remain.
+	if windowLen != 1 {
+		t.Errorf("expected CrashWindow length 1 after pruning, got %d", windowLen)
 	}
 }
 

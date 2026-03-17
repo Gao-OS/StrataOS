@@ -18,6 +18,7 @@ type Manager struct {
 	runtimeDir string
 	nodeID     string
 	startTime  time.Time
+	env        []string // captured once at construction
 	crashCh    chan string
 	backoff    BackoffConfig
 	quarantine QuarantineConfig
@@ -41,11 +42,19 @@ func NewManager(cfg ManagerConfig) *Manager {
 	if cfg.Quarantine == (QuarantineConfig{}) {
 		cfg.Quarantine = DefaultQuarantine()
 	}
+
+	// Capture environment once to avoid divergence on restarts.
+	env := append(os.Environ(), fmt.Sprintf("STRATA_RUNTIME_DIR=%s", cfg.RuntimeDir))
+	if cfg.NodeID != "" {
+		env = append(env, fmt.Sprintf("STRATA_NODE_ID=%s", cfg.NodeID))
+	}
+
 	return &Manager{
 		services:   make(map[string]*ServiceEntry),
 		runtimeDir: cfg.RuntimeDir,
 		nodeID:     cfg.NodeID,
 		startTime:  time.Now(),
+		env:        env,
 		crashCh:    make(chan string, 16),
 		backoff:    cfg.Backoff,
 		quarantine: cfg.Quarantine,
@@ -76,17 +85,15 @@ func (m *Manager) StartAll() error {
 	m.order = order
 	m.mu.Unlock()
 
-	env := append(os.Environ(), fmt.Sprintf("STRATA_RUNTIME_DIR=%s", m.runtimeDir))
-	if m.nodeID != "" {
-		env = append(env, fmt.Sprintf("STRATA_NODE_ID=%s", m.nodeID))
-	}
-
 	for _, name := range order {
 		m.mu.RLock()
 		se := m.services[name]
 		m.mu.RUnlock()
 
-		if err := se.start(env, m.crashCh); err != nil {
+		se.mu.Lock()
+		err := se.start(m.env, m.crashCh)
+		se.mu.Unlock()
+		if err != nil {
 			return fmt.Errorf("start %s: %w", name, err)
 		}
 		if m.onHealthy != nil {
@@ -110,17 +117,21 @@ func (m *Manager) StartService(name string) error {
 		m.mu.RLock()
 		depEntry, exists := m.services[dep]
 		m.mu.RUnlock()
-		if !exists || depEntry.State != Healthy {
+		if !exists {
+			return fmt.Errorf("dependency %q is not healthy", dep)
+		}
+		depEntry.mu.Lock()
+		depState := depEntry.State
+		depEntry.mu.Unlock()
+		if depState != Healthy {
 			return fmt.Errorf("dependency %q is not healthy", dep)
 		}
 	}
 
-	env := append(os.Environ(), fmt.Sprintf("STRATA_RUNTIME_DIR=%s", m.runtimeDir))
-	if m.nodeID != "" {
-		env = append(env, fmt.Sprintf("STRATA_NODE_ID=%s", m.nodeID))
-	}
-
-	if err := se.start(env, m.crashCh); err != nil {
+	se.mu.Lock()
+	err := se.start(m.env, m.crashCh)
+	se.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	if m.onHealthy != nil {
@@ -137,11 +148,16 @@ func (m *Manager) StopService(name string, drainMs int) error {
 	if !ok {
 		return fmt.Errorf("unknown service %q", name)
 	}
+
+	se.mu.Lock()
 	if se.State != Healthy && se.State != Starting {
-		return fmt.Errorf("service %q is not running (state=%s)", name, se.State)
+		state := se.State
+		se.mu.Unlock()
+		return fmt.Errorf("service %q is not running (state=%s)", name, state)
 	}
 	se.State = Stopped
-	se.stop(drainMs)
+	se.stopLocked(drainMs)
+	se.mu.Unlock()
 	return nil
 }
 
@@ -161,10 +177,13 @@ func (m *Manager) StopAll() {
 		m.mu.RLock()
 		se := m.services[name]
 		m.mu.RUnlock()
+
+		se.mu.Lock()
 		if se.State == Healthy || se.State == Starting {
 			se.State = Stopped
-			se.stop(2000)
+			se.stopLocked(defaultDrainMs)
 		}
+		se.mu.Unlock()
 	}
 }
 
@@ -181,11 +200,13 @@ func (m *Manager) ListServices() []ServiceStatus {
 	defer m.mu.RUnlock()
 	result := make([]ServiceStatus, 0, len(m.services))
 	for _, se := range m.services {
+		se.mu.Lock()
 		result = append(result, ServiceStatus{
 			Name:  se.Config.Name,
 			State: se.State.String(),
 			PID:   se.PID,
 		})
+		se.mu.Unlock()
 	}
 	return result
 }
@@ -214,52 +235,60 @@ func (m *Manager) Run(ctx context.Context) {
 
 // handleCrash processes a service crash: checks quarantine, schedules restart.
 func (m *Manager) handleCrash(name string) {
-	m.mu.Lock()
+	m.mu.RLock()
 	se, ok := m.services[name]
+	m.mu.RUnlock()
 	if !ok {
-		m.mu.Unlock()
 		return
 	}
 
+	se.mu.Lock()
+
 	// Only transition if not already stopped.
 	if se.State == Stopped {
-		m.mu.Unlock()
+		se.mu.Unlock()
 		return
 	}
 
 	se.State = Crashed
 	se.CrashCount++
-	se.CrashWindow = append(se.CrashWindow, time.Now())
+	now := time.Now()
+	se.CrashWindow = append(se.CrashWindow, now)
+
+	// Prune crash window entries outside the quarantine window.
+	cutoff := now.Add(-m.quarantine.Window)
+	pruned := se.CrashWindow[:0]
+	for _, t := range se.CrashWindow {
+		if t.After(cutoff) {
+			pruned = append(pruned, t)
+		}
+	}
+	se.CrashWindow = pruned
 
 	if ShouldQuarantine(se.CrashWindow, m.quarantine) {
 		log.Printf("[supervisor] %s quarantined (%d crashes in window)", name, se.CrashCount)
 		se.State = Quarantined
-		m.mu.Unlock()
+		se.mu.Unlock()
 		return
 	}
 
 	delay := ComputeDelay(se.CrashCount, m.backoff)
 	log.Printf("[supervisor] %s crashed (count=%d), restarting in %v", name, se.CrashCount, delay)
 	se.State = Restarting
-	m.mu.Unlock()
+	se.mu.Unlock()
 
 	time.AfterFunc(delay, func() {
-		m.mu.Lock()
-		se, ok := m.services[name]
-		if !ok || se.State != Restarting {
-			m.mu.Unlock()
+		se.mu.Lock()
+		if se.State != Restarting {
+			se.mu.Unlock()
 			return
 		}
 		// Transition Restarting → Starting happens inside start().
 		se.State = Declared // reset so start() can transition Declared → Starting
-		m.mu.Unlock()
+		err := se.start(m.env, m.crashCh)
+		se.mu.Unlock()
 
-		env := append(os.Environ(), fmt.Sprintf("STRATA_RUNTIME_DIR=%s", m.runtimeDir))
-		if m.nodeID != "" {
-			env = append(env, fmt.Sprintf("STRATA_NODE_ID=%s", m.nodeID))
-		}
-
-		if err := se.start(env, m.crashCh); err != nil {
+		if err != nil {
 			log.Printf("[supervisor] restart %s failed: %v", name, err)
 			return
 		}
@@ -270,6 +299,7 @@ func (m *Manager) handleCrash(name string) {
 }
 
 // topoSort returns service names in dependency order (Kahn's algorithm).
+// Caller must hold m.mu.
 func (m *Manager) topoSort() ([]string, error) {
 	// Build in-degree map.
 	inDegree := make(map[string]int)

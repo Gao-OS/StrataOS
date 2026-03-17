@@ -211,6 +211,11 @@ func main() {
 		if size <= 0 {
 			size = 4096
 		}
+		const maxReadSize = 1 << 20 // 1 MiB, matches IPC frame limit
+		if size > maxReadSize {
+			return ipc.ErrorResponse(req.ReqID, ipc.ErrInvalidRequest,
+				fmt.Sprintf("size exceeds maximum (%d bytes)", maxReadSize))
+		}
 
 		buf := make([]byte, int(size))
 		n, err := entry.file.ReadAt(buf, int64(offset))

@@ -6,9 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
+
+// defaultDrainMs is the default time to wait for a service to exit after SIGTERM.
+const defaultDrainMs = 2000
 
 // ServiceConfig describes how to launch and manage a service.
 type ServiceConfig struct {
@@ -20,7 +24,9 @@ type ServiceConfig struct {
 }
 
 // ServiceEntry tracks a running service's state and process.
+// All mutable fields are protected by mu.
 type ServiceEntry struct {
+	mu          sync.Mutex
 	Config      ServiceConfig
 	State       ServiceState
 	Cmd         *exec.Cmd
@@ -28,6 +34,7 @@ type ServiceEntry struct {
 	CrashCount  int
 	CrashWindow []time.Time
 	runtimeDir  string
+	done        chan struct{} // closed when the process exits (by monitor)
 }
 
 // newServiceEntry creates a ServiceEntry in Declared state.
@@ -43,6 +50,7 @@ func newServiceEntry(cfg ServiceConfig, runtimeDir string) *ServiceEntry {
 }
 
 // transition attempts a state change, returning an error for illegal transitions.
+// Caller must hold se.mu.
 func (se *ServiceEntry) transition(to ServiceState) error {
 	if !CanTransition(se.State, to) {
 		return fmt.Errorf("illegal transition for %s: %s -> %s", se.Config.Name, se.State, to)
@@ -53,10 +61,15 @@ func (se *ServiceEntry) transition(to ServiceState) error {
 
 // start spawns the service process and launches a monitor goroutine.
 // crashCh receives the service name when the process exits unexpectedly.
+// Caller must hold se.mu.
 func (se *ServiceEntry) start(env []string, crashCh chan<- string) error {
 	if err := se.transition(Starting); err != nil {
 		return err
 	}
+
+	// Remove stale socket before starting, in case a previous crash left it behind.
+	sockPath := filepath.Join(se.runtimeDir, se.Config.SocketName)
+	os.Remove(sockPath)
 
 	cmd := exec.Command(se.Config.BinaryPath)
 	cmd.Env = env
@@ -69,16 +82,20 @@ func (se *ServiceEntry) start(env []string, crashCh chan<- string) error {
 
 	se.Cmd = cmd
 	se.PID = cmd.Process.Pid
+	se.done = make(chan struct{})
 	log.Printf("[supervisor] started %s (pid=%d)", se.Config.Name, se.PID)
 
-	// Monitor goroutine: waits for process exit.
+	// Monitor goroutine: the sole goroutine that calls cmd.Wait().
 	go se.monitor(crashCh)
 
-	// Wait for socket readiness.
-	sockPath := filepath.Join(se.runtimeDir, se.Config.SocketName)
-	if !waitForFile(sockPath, se.Config.ReadyTimeout) {
+	// Wait for socket readiness (don't hold the lock during polling).
+	se.mu.Unlock()
+	ready := waitForFile(sockPath, se.Config.ReadyTimeout)
+	se.mu.Lock()
+
+	if !ready {
 		log.Printf("[supervisor] %s did not become ready (timeout waiting for %s)", se.Config.Name, sockPath)
-		se.stop(0)
+		se.stopLocked(0)
 		se.State = Crashed
 		return fmt.Errorf("%s did not become ready", se.Config.Name)
 	}
@@ -91,12 +108,21 @@ func (se *ServiceEntry) start(env []string, crashCh chan<- string) error {
 }
 
 // monitor waits for the process to exit and reports crashes.
+// This is the ONLY goroutine that calls cmd.Wait().
 func (se *ServiceEntry) monitor(crashCh chan<- string) {
 	if se.Cmd == nil || se.Cmd.Process == nil {
 		return
 	}
 	err := se.Cmd.Wait()
-	if se.State == Stopped {
+
+	// Signal that the process has exited (used by stopLocked to wait).
+	close(se.done)
+
+	se.mu.Lock()
+	state := se.State
+	se.mu.Unlock()
+
+	if state == Stopped {
 		return // intentional shutdown, not a crash
 	}
 	if err != nil {
@@ -107,8 +133,9 @@ func (se *ServiceEntry) monitor(crashCh chan<- string) {
 	crashCh <- se.Config.Name
 }
 
-// stop sends SIGTERM, waits for drainMs, then SIGKILL if still alive.
-func (se *ServiceEntry) stop(drainMs int) {
+// stopLocked sends SIGTERM, waits for drainMs, then SIGKILL if still alive.
+// Caller must hold se.mu; lock is released during the wait.
+func (se *ServiceEntry) stopLocked(drainMs int) {
 	if se.Cmd == nil || se.Cmd.Process == nil {
 		return
 	}
@@ -116,22 +143,23 @@ func (se *ServiceEntry) stop(drainMs int) {
 	se.Cmd.Process.Signal(syscall.SIGTERM)
 
 	if drainMs <= 0 {
-		drainMs = 2000
+		drainMs = defaultDrainMs
 	}
-	done := make(chan struct{})
-	go func() {
-		se.Cmd.Wait()
-		close(done)
-	}()
+
+	done := se.done
+	// Release the lock while waiting for the process to exit.
+	se.mu.Unlock()
 
 	select {
 	case <-done:
-		// Process exited cleanly.
+		// Process exited cleanly (monitor closed the channel).
 	case <-time.After(time.Duration(drainMs) * time.Millisecond):
 		log.Printf("[supervisor] %s did not exit after %dms, sending SIGKILL", se.Config.Name, drainMs)
 		se.Cmd.Process.Kill()
 		<-done
 	}
+
+	se.mu.Lock()
 }
 
 // waitForFile polls for a file's existence until timeout.
